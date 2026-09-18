@@ -454,6 +454,7 @@ async def start_web_app():
 
 async def main():
     db.init_db()
+    await bot.delete_webhook(drop_pending_updates=True)  # eski/ikkilangan sessiyalarni tozalash
     await start_web_app()
     await dp.start_polling(bot)
 
