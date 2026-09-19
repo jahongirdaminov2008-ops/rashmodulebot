@@ -25,15 +25,17 @@ FONT = "Arial"
 HELP = (
     "📊 <b>Baholash boti (Rasch modeli, Milliy sertifikat)</b>\n\n"
     "Excel (.xlsx) faylni yuboring:\n"
-    "• 1-ustun — o'quvchi ismi\n"
-    "• keyingi ustunlar — savollar (1, 2, 3 ...)\n"
-    "• har bir katakda: to'g'ri = 1, xato = 0 (bo'sh katak bo'lmasin)\n"
-    "• 'Jami', 'Ball' kabi ustunlar bo'lsa, ular o'tkazib yuboriladi\n\n"
+    "• bitta ustunda o'quvchi ismi\n"
+    "• savollar ustunlarida: to'g'ri = 1, xato = 0 (bo'sh katak bo'lmasin)\n"
+    "• sarlavha qatori, № ustuni, 'Jami' ustuni/qatori bo'lsa ham bo'ladi — bot o'zi topadi\n\n"
     "Bot har bir o'quvchiga ball (0–75), foiz va daraja qo'yib, jadval qaytaradi."
 )
 
 
 # ---------------------------------------------------------------- Excel o'qish
+SKIP_ROWS = SKIP_HEADERS | {"o'rtacha", "ortacha", "average", "mean", "jami:", "izoh"}
+
+
 def _to01(v):
     if isinstance(v, bool):
         return int(v)
@@ -44,31 +46,97 @@ def _to01(v):
     return None
 
 
-def parse_excel(data: bytes):
-    ws = load_workbook(io.BytesIO(data), data_only=True).worksheets[0]
-    rows = list(ws.iter_rows(values_only=True))
-    if len(rows) < 2:
-        raise ValueError("Jadval bo'sh: sarlavha va kamida bitta o'quvchi qatori kerak.")
-    header = rows[0]
-    filled = [i for i, h in enumerate(header) if h not in (None, "")]
-    if len(filled) < 2:
-        raise ValueError("Sarlavha qatorida savollar ustunlari topilmadi.")
-    last = max(filled)
-    q_cols = [c for c in range(1, last + 1)
-              if str(header[c] or "").strip().lower() not in SKIP_HEADERS]
-    q_names = [str(header[c]) if header[c] not in (None, "") else f"Savol {c}"
-               for c in q_cols]
+def _empty(v):
+    return v is None or (isinstance(v, str) and not v.strip())
+
+
+def _is_text(v):
+    if not isinstance(v, str) or not v.strip():
+        return False
+    try:
+        float(v.strip().replace(",", "."))
+        return False
+    except ValueError:
+        return True
+
+
+def _label(v):
+    if isinstance(v, float) and v.is_integer():
+        v = int(v)
+    return str(v).strip()
+
+
+def _parse_sheet(ws):
+    """Sarlavha qayerda bo'lishidan qat'i nazar, ism va savol (1/0) ustunlarini o'zi topadi."""
+    rows = [list(r) for r in ws.iter_rows(values_only=True)]
+    if not rows:
+        raise ValueError("Varaq bo'sh.")
+    ncol = max(len(r) for r in rows)
+    for r in rows:
+        r.extend([None] * (ncol - len(r)))
+
+    # A) savol ustunlari: to'ldirilgan kataklarning kamida 80% i 0 yoki 1 bo'lgan ustunlar
+    q_cols = []
+    for c in range(ncol):
+        vals = [r[c] for r in rows if not _empty(r[c])]
+        if len(vals) < 2:
+            continue
+        if any(isinstance(v, str) and v.strip().lower() in SKIP_HEADERS for v in vals):
+            continue
+        n01 = sum(1 for v in vals if _to01(v) is not None)
+        if n01 >= 2 and n01 / len(vals) >= 0.8:
+            q_cols.append(c)
+    if len(q_cols) < 2:
+        raise ValueError("Savollar ustunlari topilmadi: 1 va 0 dan iborat kamida 2 ta ustun kerak.")
+
+    # B) ism ustuni: savol bo'lmagan ustunlar ichida matni eng ko'pi
+    cand = {c: sum(1 for r in rows if _is_text(r[c])) for c in range(ncol) if c not in q_cols}
+    name_col = max(cand, key=cand.get) if cand else None
+    if name_col is None or cand[name_col] < 2:
+        raise ValueError("O'quvchi ismlari ustuni topilmadi.")
+
+    # A2) savol ustunlari oralig'idagi, lekin xato qiymatli ustunlarni ham qo'shamiz,
+    #     shunda ular jimgina tashlab yuborilmaydi, balki xato sifatida ko'rsatiladi
+    for c in range(q_cols[0], q_cols[-1] + 1):
+        if c in q_cols or c == name_col:
+            continue
+        vals = [r[c] for r in rows if not _empty(r[c])]
+        if vals and not any(isinstance(v, str) and v.strip().lower() in SKIP_HEADERS for v in vals):
+            q_cols.append(c)
+    q_cols.sort()
+
+    # C) birinchi 'toza' o'quvchi qatori (sarlavha/sarlavha oldi qatorlar shundan oldin)
+    first = None
+    for i, r in enumerate(rows):
+        if not _is_text(r[name_col]) or str(r[name_col]).strip().lower() in SKIP_ROWS:
+            continue
+        ok = sum(1 for c in q_cols if _to01(r[c]) is not None)
+        if ok / len(q_cols) >= 0.9:
+            first = i
+            break
+    if first is None:
+        raise ValueError("1/0 qiymatli o'quvchi qatorlari topilmadi.")
+
+    header = rows[first - 1] if first > 0 else None
+    q_names = []
+    for k, c in enumerate(q_cols, start=1):
+        h = header[c] if header is not None else None
+        q_names.append(str(k) if _empty(h) else _label(h))
 
     names, matrix, errors = [], [], []
-    for r_idx, row in enumerate(rows[1:], start=2):
-        if all(c in (None, "") for c in row):
-            continue
-        name = str(row[0]).strip() if row[0] not in (None, "") else f"Noma'lum (qator {r_idx})"
+    for i in range(first, len(rows)):
+        r = rows[i]
+        nm = r[name_col]
+        if all(_empty(r[c]) for c in q_cols):
+            continue                      # izoh / bo'sh qator
+        if isinstance(nm, str) and nm.strip().lower() in SKIP_ROWS:
+            continue                      # 'Jami' kabi yakuniy qator
+        name = str(nm).strip() if not _empty(nm) else f"Noma'lum (qator {i + 1})"
         vals = []
         for c in q_cols:
-            v = _to01(row[c] if c < len(row) else None)
+            v = _to01(r[c])
             if v is None:
-                errors.append(f"{get_column_letter(c + 1)}{r_idx}")
+                errors.append(f"{get_column_letter(c + 1)}{i + 1}")
             vals.append(v)
         names.append(name)
         matrix.append(vals)
@@ -76,9 +144,25 @@ def parse_excel(data: bytes):
     if errors:
         shown = ", ".join(errors[:15]) + (f" ... (jami {len(errors)} ta)" if len(errors) > 15 else "")
         raise ValueError("Faqat 1 yoki 0 bo'lishi kerak. Noto'g'ri/bo'sh kataklar: " + shown)
-    if len(names) < 2 or len(q_names) < 2:
-        raise ValueError("Kamida 2 ta o'quvchi va 2 ta savol kerak.")
-    return names, q_names, matrix
+    if len(names) < 2:
+        raise ValueError("Kamida 2 ta o'quvchi kerak.")
+    info = (f"Ismlar: {get_column_letter(name_col + 1)} ustun; savollar: "
+            f"{get_column_letter(q_cols[0] + 1)}–{get_column_letter(q_cols[-1] + 1)} ({len(q_cols)} ta)")
+    return names, q_names, matrix, info
+
+
+def parse_excel(data: bytes):
+    wb = load_workbook(io.BytesIO(data), data_only=True)
+    errs = []
+    for ws in wb.worksheets:
+        try:
+            return _parse_sheet(ws)
+        except ValueError as e:
+            errs.append(str(e))
+    for e in errs:                        # ma'lumot topilgan, lekin xato kataklar bor varaq
+        if e.startswith("Faqat 1 yoki 0"):
+            raise ValueError(e)
+    raise ValueError(errs[0] + " Jadval 1-varaqda bo'lsin: ism ustuni va 1/0 ustunlari.")
 
 
 # ---------------------------------------------------------------- Excel yozish
@@ -208,7 +292,7 @@ async def process_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg_file = await msg.document.get_file()
         data = bytes(await tg_file.download_as_bytearray())
-        names, q_names, matrix = parse_excel(data)
+        names, q_names, matrix, info = parse_excel(data)
         res = rasch.fit(matrix)
         report = build_report(names, q_names, res)
     except ValueError as e:
@@ -229,7 +313,7 @@ async def process_results(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not res["converged"]:
         warn.append("⚠️ Hisoblash to'liq yaqinlashmadi — natijalarga ehtiyot bo'ling.")
     rel = res["reliability"]
-    summary = (f"✅ {res['n_persons']} ta o'quvchi, {res['n_items']} ta savol"
+    summary = (f"✅ {res['n_persons']} ta o'quvchi, {res['n_items']} ta savol\n{info}"
                + (f", ishonchlilik: {rel:.2f}" if rel is not None else "")
                + ("\n" + "\n".join(warn) if warn else ""))
     await msg.reply_text(summary)
