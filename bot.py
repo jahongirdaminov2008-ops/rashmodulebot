@@ -2,6 +2,8 @@ import html
 import io
 import logging
 import os
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -252,12 +254,37 @@ async def on_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(HELP, parse_mode=ParseMode.HTML)
 
 
+# ---------------------------------------------------------------- Render uchun port
+class Ping(BaseHTTPRequestHandler):
+    """Render 'Web Service' port talab qiladi — shu sabab kichik health-check server."""
+
+    def _ok(self):
+        self.send_response(200)
+        self.end_headers()
+
+    def do_GET(self):
+        self._ok()
+        self.wfile.write(b"OK")
+
+    def do_HEAD(self):
+        self._ok()
+
+    def log_message(self, *args):
+        pass
+
+
+def run_web():
+    HTTPServer(("0.0.0.0", int(os.environ["PORT"])), Ping).serve_forever()
+
+
 def main():
+    if os.environ.get("PORT"):  # Render Web Service
+        threading.Thread(target=run_web, daemon=True).start()
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(~filters.COMMAND & ~filters.Document.ALL, on_other))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
