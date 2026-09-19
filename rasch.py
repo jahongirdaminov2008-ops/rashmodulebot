@@ -1,186 +1,207 @@
 """
-Rasch modeli (dixotomik, JMLE) — Milliy sertifikat uslubidagi baholash.
+rasch.py - Matematika Milliy sertifikat uchun baholash moduli.
 
-Model:  P(x=1) = 1 / (1 + exp(-(theta - b)))
-  theta — o'quvchi qobiliyati (logit), b — savol qiyinligi (logit)
+Ishlash tartibi:
+1. Rasch modeli (JMLE) har bir savolning qiyinligini (b, logit) aniqlaydi.
+   Kam odam yechgan savol -> b katta (qiyin).
+2. Har bir savolga og'irlik beriladi: eng oson savol = 1, eng qiyin = 1 + HARDNESS.
+3. Ball = (o'quvchi yig'gan og'irlik / jami og'irlik) * 100.
+   Demak bir xil sondagi to'g'ri javob bergan ikki o'quvchidan qiyin
+   savollarni yechgani yuqori ball oladi.
+4. Rasch qobiliyati (theta) ham hisoblanadi (faqat ma'lumot uchun).
 
-Bosqichlar:
- 1. Hamma to'g'ri / hamma xato savollar va 0 yoki 100% olgan o'quvchilar
-    kalibrovkadan chiqariladi (ular haqida ma'lumot yo'q).
- 2. Savol qiyinliklari JMLE (Newton-Raphson) bilan topiladi, o'rtacha qiyinlik = 0.
- 3. JMLE siljishi uchun (k-1)/k tuzatish beriladi.
- 4. Har bir o'quvchining theta'si topiladi. 0 yoki 100% olganlar uchun
-    standart 0.3 tuzatish ishlatiladi.
- 5. theta -> ball (0..75) chiziqli o'tkazilib, daraja belgilanadi.
-
-MUHIM: DTM ning theta -> ball o'tkazish formulasi ommaga e'lon qilinmagan.
-Bu yerda ochiq va sozlanadigan chiziqli shkala ishlatilgan (LOGIT_RANGE).
+Kerak: numpy, pandas, openpyxl
 """
+
 import numpy as np
+import pandas as pd
 
-MAX_BALL = 75.0        # Milliy sertifikat maksimal bali
-LOGIT_RANGE = 3.0      # theta = -3..+3 logit  ->  0..75 ball
-EXTREME_CORR = 0.3     # 0 yoki to'liq ball uchun standart tuzatish
+HARDNESS = 1.0  # 0 -> barcha savol teng; 1 -> eng qiyin savol 2x, 2 -> 3x
 
-
-def level(ball: float) -> str:
-    """Milliy sertifikat darajalari (ball 1 xonagacha yaxlitlanadi)."""
-    b = round(float(ball), 1)
-    if b > 70:
-        return "A+"
-    if b >= 65:
-        return "A"
-    if b >= 60:
-        return "B+"
-    if b >= 55:
-        return "B"
-    if b >= 50:
-        return "C+"
-    if b >= 46:
-        return "C"
-    return "Sertifikat yo'q"
+# Milliy sertifikat darajalari (ball chegarasi, daraja)
+LEVELS = [
+    (70.0, "A+"),
+    (65.0, "A"),
+    (60.0, "B+"),
+    (55.0, "B"),
+    (50.0, "C+"),
+    (46.0, "C"),
+]
+NO_LEVEL = "Sertifikatsiz"
 
 
-def theta_to_ball(theta):
-    ball = MAX_BALL / 2 + (MAX_BALL / (2 * LOGIT_RANGE)) * np.asarray(theta, float)
-    return np.clip(ball, 0.0, MAX_BALL)
+def _logit(p):
+    return np.log(p / (1.0 - p))
 
 
-def _prob(theta, b):
-    return 1.0 / (1.0 + np.exp(-(theta[:, None] - b[None, :])))
-
-
-def _solve_theta(r, b):
-    """Berilgan b da (tuzatilgan) xom ball r ga mos theta ni topadi."""
-    k = len(b)
-    theta = np.log(r / (k - r))
-    for _ in range(200):
-        p = _prob(theta, b)
-        w = (p * (1 - p)).sum(1)
-        step = np.clip((r - p.sum(1)) / w, -1.0, 1.0)
-        theta = theta + step
-        if np.max(np.abs(step)) < 1e-9:
-            break
-    return theta
-
-
-def fit(X):
+def rasch_jmle(X, max_iter=200, tol=1e-6):
     """
-    X — (o'quvchilar x savollar) 0/1 matritsa.
-    Natija: dict (person massivlari o'quvchilar tartibida, item — savollar tartibida).
+    X: (N o'quvchi x K savol) 0/1 massiv.
+    Qaytaradi: theta (N,), b (K,) - logitlarda, b o'rtachasi 0.
+    Hamma to'g'ri / hamma xato holatlari 0.5 tuzatish bilan hal qilinadi.
     """
-    X = np.asarray(X, float)
-    n, k = X.shape
+    X = np.asarray(X, dtype=float)
+    N, K = X.shape
 
-    # 1) ekstremal savol/o'quvchilarni takroran chiqarish
-    item_ok = np.ones(k, bool)
-    person_ok = np.ones(n, bool)
-    while True:
-        sub = X[person_ok][:, item_ok]
-        ns, ks = sub.shape
-        if ns < 2 or ks < 2:
-            raise ValueError(
-                "Rasch uchun yetarli ma'lumot yo'q: kamida 2 ta o'quvchi va 2 ta "
-                "'aralash' (ba'zilari to'g'ri, ba'zilari xato) savol kerak."
-            )
-        isc, psc = sub.sum(0), sub.sum(1)
-        new_i, new_p = item_ok.copy(), person_ok.copy()
-        new_i[np.where(item_ok)[0][(isc == 0) | (isc == ns)]] = False
-        new_p[np.where(person_ok)[0][(psc == 0) | (psc == ks)]] = False
-        if (new_i == item_ok).all() and (new_p == person_ok).all():
-            break
-        item_ok, person_ok = new_i, new_p
-
-    sub = X[person_ok][:, item_ok]
-    ns, ks = sub.shape
-    s_i, r_p = sub.sum(0), sub.sum(1)
-
-    # 2) JMLE
-    b = np.log((ns - s_i) / s_i)
+    # Boshlang'ich qiymatlar (0.5 tuzatish - ekstremal holatlar uchun)
+    item_p = (X.sum(axis=0) + 0.5) / (N + 1.0)
+    person_p = (X.sum(axis=1) + 0.5) / (K + 1.0)
+    b = -_logit(item_p)
     b -= b.mean()
-    th = np.log(r_p / (ks - r_p))
-    converged = False
-    for _ in range(2000):
-        p = _prob(th, b)
-        w_p = (p * (1 - p)).sum(1)
-        d_th = np.clip((r_p - p.sum(1)) / w_p, -1.0, 1.0)
-        th = th + d_th
-        p = _prob(th, b)
-        w_i = (p * (1 - p)).sum(0)
-        d_b = np.clip((p.sum(0) - s_i) / w_i, -1.0, 1.0)
-        b = b + d_b
-        b -= b.mean()
-        if max(np.abs(d_th).max(), np.abs(d_b).max()) < 1e-7:
-            converged = True
+    theta = _logit(person_p)
+
+    # Kalibrovka uchun ekstremal o'quvchi/savollarni chiqarib tashlaymiz
+    rs = X.sum(axis=1)
+    cs = X.sum(axis=0)
+    p_ok = (rs > 0) & (rs < K)
+    i_ok = (cs > 0) & (cs < N)
+    if p_ok.sum() < 3 or i_ok.sum() < 3:
+        # Ma'lumot juda kam - PROX natijasi bilan cheklanamiz
+        return theta, b
+
+    Xc = X[np.ix_(p_ok, i_ok)]
+    Nc, Kc = Xc.shape
+    th = theta[p_ok].copy()
+    bb = b[i_ok].copy()
+
+    for _ in range(max_iter):
+        P = 1.0 / (1.0 + np.exp(-(th[:, None] - bb[None, :])))
+        W = P * (1.0 - P)
+
+        # Savol qiyinligi (Newton qadami)
+        d_b = -(Xc.sum(axis=0) - P.sum(axis=0)) / np.maximum(W.sum(axis=0), 1e-9)
+        d_b = np.clip(d_b, -1.0, 1.0)
+        bb_new = bb + d_b
+        bb_new -= bb_new.mean()
+
+        # O'quvchi qobiliyati (Newton qadami)
+        P = 1.0 / (1.0 + np.exp(-(th[:, None] - bb_new[None, :])))
+        W = P * (1.0 - P)
+        d_t = (Xc.sum(axis=1) - P.sum(axis=1)) / np.maximum(W.sum(axis=1), 1e-9)
+        d_t = np.clip(d_t, -1.0, 1.0)
+        th_new = th + d_t
+
+        delta = max(np.abs(bb_new - bb).max(), np.abs(th_new - th).max())
+        bb, th = bb_new, th_new
+        if delta < tol:
             break
 
-    # 3) JMLE siljishini tuzatish
-    b = b * (ks - 1) / ks
-    b -= b.mean()
+    # JMLE siljishini tuzatish (L-1)/L
+    bb = bb * (Kc - 1.0) / Kc
 
-    # 4) barcha o'quvchilar uchun theta (kalibrovkaga kirgan savollar bo'yicha)
-    r_all = X[:, item_ok].sum(1)
-    r_adj = np.clip(r_all, EXTREME_CORR, ks - EXTREME_CORR)
-    theta = _solve_theta(r_adj, b)
-    p_all = _prob(theta, b)
-    se = 1.0 / np.sqrt((p_all * (1 - p_all)).sum(1))
+    # Kalibrovkadan tashqarida qolgan savollar uchun qiyinlik
+    b_full = b.copy()
+    b_full[i_ok] = bb
+    if (~i_ok).any():
+        # to'g'ri yechganlar ulushi bo'yicha, chegaralangan
+        b_full[~i_ok] = np.clip(b[~i_ok], bb.min() - 1.0, bb.max() + 1.0)
 
-    # 5) ball, foiz, daraja
-    ball = np.round(theta_to_ball(theta), 1)
-    foiz = np.round(ball / MAX_BALL * 100, 1)
-    daraja = [level(x) for x in ball]
+    # Hamma o'quvchining qobiliyatini yakuniy b bo'yicha hisoblaymiz
+    theta_full = _estimate_theta(X, b_full)
+    return theta_full, b_full
 
-    # savollar statistikasi (faqat kalibrovkadagi o'quvchilar bo'yicha)
-    p_c = _prob(theta[person_ok], b)
-    x_c = sub
-    w_c = p_c * (1 - p_c)
-    item_se = 1.0 / np.sqrt(w_c.sum(0))
-    infit = ((x_c - p_c) ** 2).sum(0) / w_c.sum(0)
-    outfit = (((x_c - p_c) ** 2) / w_c).mean(0)
 
-    idx = np.where(item_ok)[0]
-    items = []
-    for j in range(k):
-        correct = int(X[:, j].sum())
-        row = {
-            "index": j,
-            "correct": correct,
-            "pct": round(100.0 * correct / n, 1),
-            "b": None, "se": None, "infit": None, "outfit": None,
-            "status": "",
+def _estimate_theta(X, b, max_iter=100):
+    """Har bir o'quvchi uchun MLE (ekstremal holatlarda 0.5 tuzatish)."""
+    N, K = X.shape
+    raw = X.sum(axis=1)
+    adj = np.clip(raw, 0.5, K - 0.5)  # 0 va K uchun tuzatish
+    th = _logit((adj) / K)
+    for _ in range(max_iter):
+        P = 1.0 / (1.0 + np.exp(-(th[:, None] - b[None, :])))
+        W = np.maximum((P * (1.0 - P)).sum(axis=1), 1e-9)
+        step = np.clip((adj - P.sum(axis=1)) / W, -1.0, 1.0)
+        th = th + step
+        if np.abs(step).max() < 1e-8:
+            break
+    return th
+
+
+def item_weights(b, hardness=HARDNESS):
+    """Eng oson savol = 1, eng qiyin savol = 1 + hardness."""
+    b = np.asarray(b, dtype=float)
+    span = b.max() - b.min()
+    if span < 1e-9:
+        return np.ones_like(b)
+    return 1.0 + hardness * (b - b.min()) / span
+
+
+def level_of(ball):
+    for cut, name in LEVELS:
+        if ball >= cut:
+            return name
+    return NO_LEVEL
+
+
+def grade(X, names=None, hardness=HARDNESS):
+    """
+    X: (N x K) 0/1 natijalar. Qaytaradi: (natija DataFrame, savollar DataFrame).
+    """
+    X = np.asarray(X, dtype=float)
+    N, K = X.shape
+    if names is None:
+        names = [f"O'quvchi {i + 1}" for i in range(N)]
+
+    theta, b = rasch_jmle(X)
+    w = item_weights(b, hardness)
+
+    raw = X.sum(axis=1)
+    ball = (X @ w) / w.sum() * 100.0
+
+    res = pd.DataFrame(
+        {
+            "Ism": names,
+            "To'g'ri": raw.astype(int),
+            "Foiz": np.round(raw / K * 100.0, 1),
+            "Ball": np.round(ball, 1),
+            "Daraja": [level_of(round(v, 1)) for v in ball],
+            "Theta": np.round(theta, 2),
         }
-        if item_ok[j]:
-            m = int(np.where(idx == j)[0][0])
-            row.update(b=float(b[m]), se=float(item_se[m]),
-                       infit=float(infit[m]), outfit=float(outfit[m]),
-                       status="Baholandi")
-        else:
-            row["status"] = ("Hamma to'g'ri — hisobga olinmadi" if correct == n
-                             else "Hamma xato — hisobga olinmadi" if correct == 0
-                             else "Hisobga olinmadi")
-        items.append(row)
+    )
+    res = res.sort_values("Ball", ascending=False).reset_index(drop=True)
+    res.insert(0, "O'rin", np.arange(1, N + 1))
 
-    # ishonchlilik (person separation reliability)
-    reliability = None
-    if person_ok.sum() >= 3:
-        var_obs = np.var(theta[person_ok], ddof=1)
-        mse = np.mean(se[person_ok] ** 2)
-        if var_obs > 0:
-            reliability = float(max(0.0, (var_obs - mse) / var_obs))
+    items = pd.DataFrame(
+        {
+            "Savol": np.arange(1, K + 1),
+            "Yechgan %": np.round(X.mean(axis=0) * 100.0, 1),
+            "Qiyinlik (b)": np.round(b, 2),
+            "Og'irlik": np.round(w, 2),
+        }
+    )
+    return res, items
 
-    return {
-        "n_persons": n,
-        "n_items": k,
-        "n_items_used": int(item_ok.sum()),
-        "n_persons_calibrated": int(person_ok.sum()),
-        "raw_total": X.sum(1).astype(int),
-        "raw_used": r_all.astype(int),
-        "theta": theta,
-        "se": se,
-        "ball": ball,
-        "foiz": foiz,
-        "daraja": daraja,
-        "items": items,
-        "reliability": reliability,
-        "converged": converged,
-    }
+
+def grade_excel(path, hardness=HARDNESS):
+    """
+    Excel: birinchi ustun(lar) - ism (matn), qolganlari - savollar (1 yoki 0).
+    """
+    df = pd.read_excel(path)
+    q_cols = []
+    for c in df.columns:
+        col = pd.to_numeric(df[c], errors="coerce")
+        if col.notna().all() and set(col.unique()) <= {0, 1}:
+            q_cols.append(c)
+    if not q_cols:
+        raise ValueError("Excelda 1/0 dan iborat savol ustunlari topilmadi.")
+
+    name_cols = [c for c in df.columns if c not in q_cols]
+    if name_cols:
+        names = df[name_cols[0]].astype(str).tolist()
+    else:
+        names = None
+
+    X = df[q_cols].apply(pd.to_numeric).to_numpy(dtype=float)
+    return grade(X, names, hardness)
+
+
+if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) < 2:
+        print("Foydalanish: python rasch.py natijalar.xlsx")
+        raise SystemExit(1)
+    result, items = grade_excel(sys.argv[1])
+    print(result.to_string(index=False))
+    print()
+    print(items.to_string(index=False))
